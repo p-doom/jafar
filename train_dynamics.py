@@ -34,7 +34,7 @@ class Args:
     image_channels: int = 3
     image_height: int = 90
     image_width: int = 160
-    data_dir: str = "data_tfrecords/coinrun"
+    data_dir: str = ""
     # Optimization
     batch_size: int = 36
     min_lr: float = 3e-6
@@ -211,18 +211,21 @@ if __name__ == "__main__":
     )
 
     # --- TRAIN LOOP ---
-    tfrecord_files = [
+    array_record_files = [
         os.path.join(args.data_dir, x)
         for x in os.listdir(args.data_dir)
-        if x.endswith(".tfrecord")
+        if x.endswith(".array_record")
     ]
     dataloader = get_dataloader(
         # NOTE: We deliberately pass the global batch size
         # The dataloader shards the dataset across all processes
-        tfrecord_files,
+        array_record_files,
         args.seq_len,
         args.batch_size,
         *image_shape,
+        num_workers=8,
+        prefetch_buffer_size=1,
+        seed=args.seed,
     )
     dataloader = (jax.make_array_from_process_local_data(videos_sharding, elem) for elem in dataloader) # type: ignore
     step = 0

@@ -42,29 +42,33 @@ class Args:
     lr_schedule : str = "wsd" # supported options: wsd, cos
     # Tokenizer
     tokenizer_dim: int = 512
+    tokenizer_ffn_dim: int = 2048
     latent_patch_dim: int = 32
     num_patch_latents: int = 1024
     patch_size: int = 4
-    tokenizer_num_blocks: int = 8
+    tokenizer_num_blocks: int = 4
     tokenizer_num_heads: int = 8
     tokenizer_checkpoint: str = ""
     # LAM
     lam_dim: int = 512
+    lam_ffn_dim: int = 2048
     latent_action_dim: int = 32
-    num_latent_actions: int = 6
+    num_actions: int = 6
     lam_patch_size: int = 16
-    lam_num_blocks: int = 8
+    lam_num_blocks: int = 4
     lam_num_heads: int = 8
     lam_checkpoint: str = ""
     # Dynamics
     dyna_dim: int = 512
-    dyna_num_blocks: int = 12
+    dyna_ffn_dim: int = 2048
+    dyna_num_blocks: int = 6
     dyna_num_heads: int = 8
     dropout: float = 0.0
     mask_limit: float = 0.5
     param_dtype: jnp.dtype = jnp.float32
     dtype: jnp.dtype = jnp.bfloat16
     use_flash_attention: bool = True
+    use_gt_actions: bool = False
     # Logging
     log: bool = False
     entity: str = ""
@@ -105,14 +109,18 @@ def dynamics_loss_fn(params, state, inputs):
     recon = outputs["recon"].clip(0, 1).reshape(-1, *outputs["recon"].shape[2:])
     psnr = pix.psnr(gt, recon).mean() # type: ignore
     ssim = pix.ssim(gt, recon).mean() # type: ignore
-    _, index_counts_lam = jnp.unique_counts(
-        jnp.ravel(outputs["lam_indices"]), size=args.num_latent_actions, fill_value=0
-    )
     _, index_counts_tokenizer = jnp.unique_counts(
         jnp.ravel(outputs["video_tokens"]), size=args.num_patch_latents, fill_value=0
     )
-    codebook_usage_lam = (index_counts_lam != 0).mean()
     codebook_usage_tokenizer = (index_counts_tokenizer != 0).mean()
+    # FIXME (f.srambical): check whether the if-else breaks jitting
+    if not args.use_gt_actions:
+        _, index_counts_lam = jnp.unique_counts(
+            jnp.ravel(outputs["lam_indices"]), size=args.num_actions, fill_value=0
+        )
+        codebook_usage_lam = (index_counts_lam != 0).mean()
+    else:
+        codebook_usage_lam = None
     metrics = dict(
         cross_entropy_loss=ce_loss,
         masked_token_accuracy=acc,
@@ -162,6 +170,7 @@ if __name__ == "__main__":
         # Tokenizer
         in_dim=args.image_channels,
         tokenizer_dim=args.tokenizer_dim,
+        tokenizer_ffn_dim=args.tokenizer_ffn_dim,
         latent_patch_dim=args.latent_patch_dim,
         num_patch_latents=args.num_patch_latents,
         patch_size=args.patch_size,
@@ -169,14 +178,16 @@ if __name__ == "__main__":
         tokenizer_num_heads=args.tokenizer_num_heads,
         # LAM
         lam_dim=args.lam_dim,
+        lam_ffn_dim=args.lam_ffn_dim,
         latent_action_dim=args.latent_action_dim,
-        num_latent_actions=args.num_latent_actions,
+        num_actions=args.num_actions,
         lam_patch_size=args.lam_patch_size,
         lam_num_blocks=args.lam_num_blocks,
         lam_num_heads=args.lam_num_heads,
         lam_co_train=not args.lam_checkpoint,
         # Dynamics
         dyna_dim=args.dyna_dim,
+        dyna_ffn_dim=args.dyna_ffn_dim,
         dyna_num_blocks=args.dyna_num_blocks,
         dyna_num_heads=args.dyna_num_heads,
         dropout=args.dropout,
@@ -184,6 +195,7 @@ if __name__ == "__main__":
         param_dtype=args.param_dtype,
         dtype=args.dtype,
         use_flash_attention=args.use_flash_attention,
+        use_gt_actions=args.use_gt_actions,
     )
     rng, _rng = jax.random.split(rng)
     image_shape = (args.image_height, args.image_width, args.image_channels)
@@ -320,8 +332,21 @@ if __name__ == "__main__":
             # --- Train step ---
             rng, _rng, _rng_dropout, _rng_mask = jax.random.split(rng, 4)
 
+            if args.use_gt_actions:
+                # FIXME (f.srambical): use real actions instead of mock actions
+                actions = jax.random.randint(
+                    _rng, 
+                    shape=(videos.shape[0], videos.shape[1]), 
+                    minval=0, 
+                    maxval=args.num_actions,
+                    dtype=jnp.int32
+                )
+            else:
+                actions = None
+
             inputs = dict(
                 videos=videos,
+                actions=actions,
                 rng=_rng,
                 dropout_rng=_rng_dropout,
                 mask_rng=_rng_mask,

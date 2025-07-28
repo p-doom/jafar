@@ -6,13 +6,14 @@ import jax.numpy as jnp
 import flax.nnx as nnx
 import orbax.checkpoint as ocp
 
-from models.dynamics import DynamicsMaskGIT
+from models.dynamics_causal import DynamicsCausal
+from models.dynamics_maskgit import DynamicsMaskGIT
 from models.lam import LatentActionModel
 from models.tokenizer import TokenizerVQVAE
 
 
-class Genie(nnx.Module):
-    """Genie model"""
+class Jasmine(nnx.Module):
+    """World model with three components: a tokenizer, a latent action model (LAM), and a dynamics model for predicting future tokens."""
 
     def __init__(
         self,
@@ -32,6 +33,7 @@ class Genie(nnx.Module):
         lam_num_blocks: int,
         lam_num_heads: int,
         lam_co_train: bool,
+        dynamics_type: str,
         dyna_dim: int,
         dyna_ffn_dim: int,
         dyna_num_blocks: int,
@@ -39,6 +41,7 @@ class Genie(nnx.Module):
         param_dtype: jnp.dtype,
         dtype: jnp.dtype,
         use_flash_attention: bool,
+        decode: bool,
         rngs: nnx.Rngs,
         dropout: float = 0.0,
         mask_limit: float = 0.0,
@@ -62,6 +65,7 @@ class Genie(nnx.Module):
         self.lam_num_heads = lam_num_heads
         self.lam_co_train = lam_co_train
         # --- Dynamics ---
+        self.dynamics_type = dynamics_type
         self.dyna_dim = dyna_dim
         self.dyna_ffn_dim = dyna_ffn_dim
         self.dyna_num_blocks = dyna_num_blocks
@@ -69,6 +73,7 @@ class Genie(nnx.Module):
         self.param_dtype = param_dtype
         self.dtype = dtype
         self.use_flash_attention = use_flash_attention
+        self.decode = decode
         self.dropout = dropout
         self.mask_limit = mask_limit
 
@@ -104,20 +109,38 @@ class Genie(nnx.Module):
             use_flash_attention=self.use_flash_attention,
             rngs=rngs,
         )
-        self.dynamics = DynamicsMaskGIT(
-            model_dim=self.dyna_dim,
-            ffn_dim=self.dyna_ffn_dim,
-            num_latents=self.num_patch_latents,
-            latent_action_dim=self.latent_action_dim,
-            num_blocks=self.dyna_num_blocks,
-            num_heads=self.dyna_num_heads,
-            dropout=self.dropout,
-            mask_limit=self.mask_limit,
-            param_dtype=self.param_dtype,
-            dtype=self.dtype,
-            use_flash_attention=self.use_flash_attention,
-            rngs=rngs,
-        )
+        if self.dynamics_type == "maskgit":
+            self.dynamics = DynamicsMaskGIT(
+                model_dim=self.dyna_dim,
+                ffn_dim=self.dyna_ffn_dim,
+                num_latents=self.num_patch_latents,
+                latent_action_dim=self.latent_action_dim,
+                num_blocks=self.dyna_num_blocks,
+                num_heads=self.dyna_num_heads,
+                dropout=self.dropout,
+                mask_limit=self.mask_limit,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                use_flash_attention=self.use_flash_attention,
+                rngs=rngs,
+            )
+        elif self.dynamics_type == "causal":
+            self.dynamics = DynamicsCausal(
+                model_dim=self.dyna_dim,
+                ffn_dim=self.dyna_ffn_dim,
+                num_latents=self.num_patch_latents,
+                latent_action_dim=self.latent_action_dim,
+                num_blocks=self.dyna_num_blocks,
+                num_heads=self.dyna_num_heads,
+                dropout=self.dropout,
+                param_dtype=self.param_dtype,
+                dtype=self.dtype,
+                use_flash_attention=self.use_flash_attention,
+                decode=self.decode,
+                rngs=rngs,
+            )
+        else:
+            raise ValueError(f"Invalid dynamics type: {self.dynamics_type}")
 
     def __call__(
         self, batch: Dict[str, jax.Array], training: bool = True
@@ -144,7 +167,7 @@ class Genie(nnx.Module):
         outputs["lam_indices"] = lam_outputs["indices"]
         return outputs
 
-    def sample(
+    def sample_maskgit(
         self,
         batch: Dict[str, jax.Array],
         seq_len: int,
@@ -174,6 +197,7 @@ class Genie(nnx.Module):
             A: action space
             D: model latent dimension
         """
+        assert self.dynamics_type == "maskgit"
         # --- Encode videos and actions ---
         tokenizer_out = self.tokenizer.vq_encode(batch["videos"], training=False)
         token_idxs = tokenizer_out["indices"]  # (B, T, N)
@@ -191,6 +215,8 @@ class Genie(nnx.Module):
 
             # --- Construct + encode video ---
             vid_embed = self.dynamics.patch_embed(token_idxs)  # (B, S, N, D)
+            if not isinstance(self.dynamics, DynamicsMaskGIT):
+                raise TypeError("`sample_maskgit` requires `DynamicsMaskGIT`.")
             mask_token = self.dynamics.mask_token.value  # (1, 1, 1, D,)
             mask_expanded = mask[..., None]  # (B, S, N, 1)
             vid_embed = jnp.where(mask_expanded, mask_token, vid_embed)
@@ -200,7 +226,7 @@ class Genie(nnx.Module):
             vid_embed += jnp.pad(act_embed, ((0, 0), (1, 0), (0, 0), (0, 0)))
             unmasked_ratio = jnp.cos(jnp.pi * (step + 1) / (steps * 2))
             step_temp = temperature * (1.0 - unmasked_ratio)
-            final_logits = self.dynamics.dynamics(vid_embed) / step_temp
+            final_logits = self.dynamics.transformer(vid_embed) / step_temp
 
             # --- Sample new tokens for final frame ---
             if sample_argmax:
@@ -269,6 +295,96 @@ class Genie(nnx.Module):
         )
         return final_frames
 
+    def sample_causal(
+        self,
+        batch: Dict[str, jax.Array],
+        seq_len: int,
+        temperature: float = 1,
+        sample_argmax: bool = False,
+    ) -> jax.Array:
+        """
+        Autoregressively samples up to `seq_len` future frames using the causal transformer backend.
+        - Input frames are tokenized once.
+        - Future frames are generated one at a time, each conditioned on all previous frames.
+        - All frames are detokenized in a single pass at the end.
+        Args:
+            batch: Dict with at least "videos" (B, T, H, W, C)
+            seq_len: total number of frames to generate (including context)
+            temperature: sampling temperature
+            sample_argmax: if True, use argmax instead of sampling
+        Returns:
+            Generated video frames (B, seq_len, H, W, C)
+        """
+        # --- Encode context frames ---
+        tokenizer_out = self.tokenizer.vq_encode(batch["videos"], training=False)
+        token_idxs = tokenizer_out["indices"]  # (B, T, N)
+        B, T, N = token_idxs.shape
+
+        # --- Prepare initial token sequence ---
+        # Pad with zeros for future frames
+        pad_shape = (B, seq_len - T, N)
+        token_idxs_full = jnp.concatenate(
+            [token_idxs, jnp.zeros(pad_shape, dtype=token_idxs.dtype)], axis=1
+        )  # (B, seq_len, N)
+
+        # --- Prepare latent actions ---
+        action_tokens = self.lam.vq.get_codes(batch["latent_actions"])  # (B, S-1, )
+
+        def token_step_fn(
+            carry: tuple[jax.Array, jax.Array, jax.Array], token_idx: jax.Array
+        ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], None]:
+            rng, token_idxs_full, action_tokens = carry
+            t = token_idx // N
+            n = token_idx % N
+
+            # For autoregressive decoding, we only need to pass the token from the previous step.
+            # The model internally uses a KV cache to remember previous tokens.
+            current_token_sequence = jax.lax.dynamic_slice(
+                token_idxs_full, (0, t, 0), (B, 1, N)
+            )
+
+            dyna_inputs = {
+                "video_tokens": current_token_sequence,
+                "latent_actions": action_tokens,
+            }
+            # The model will output logits for all patches in the sequence (which is just one frame).
+            next_token_logits, _ = self.dynamics(dyna_inputs, training=False)
+            # We select the logits for the specific patch `n` we are currently generating.
+            next_token_logits = next_token_logits[:, 0, n, :].astype(
+                jnp.float32
+            )  # (B, vocab_size)
+
+            if sample_argmax:
+                next_token = jnp.argmax(next_token_logits, axis=-1)  # (B,)
+            else:
+                rng, step_rng = jax.random.split(rng)
+                next_token = jax.random.categorical(
+                    step_rng, next_token_logits / temperature, axis=-1
+                )  # (B,)
+
+            # Insert the generated token into the full sequence.
+            token_idxs_full = token_idxs_full.at[:, t, n].set(next_token)
+
+            new_carry = (rng, token_idxs_full, action_tokens)
+            return new_carry, None
+
+        # --- Autoregressive generation ---
+        future_frames = seq_len - T
+        total_future_tokens = future_frames * N
+        start_token_idx = T * N
+        step_indices = jnp.arange(start_token_idx, start_token_idx + total_future_tokens)
+
+        initial_carry = (batch["rng"], token_idxs_full, action_tokens)
+        final_carry, _ = jax.lax.scan(
+            token_step_fn, initial_carry, step_indices
+        )
+        final_token_idxs = final_carry[1]
+
+        # --- Decode all tokens at once at the end ---
+        H, W = batch["videos"].shape[2:4]
+        final_frames = self.tokenizer.decode(final_token_idxs, video_hw=(H, W))
+        return final_frames
+
     def vq_encode(self, batch: Dict[str, jax.Array], training: bool) -> jax.Array:
         # --- Preprocess videos ---
         lam_output = self.lam.vq_encode(batch["videos"], training=training)
@@ -276,7 +392,7 @@ class Genie(nnx.Module):
 
 
 # FIXME (f.srambical): add conversion script for old checkpoints
-def restore_genie_components(
+def restore_components(
     optimizer: nnx.Optimizer,
     sharding: jax.sharding.NamedSharding,
     rng: jax.Array,

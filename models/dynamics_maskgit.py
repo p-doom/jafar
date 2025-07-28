@@ -37,7 +37,7 @@ class DynamicsMaskGIT(nnx.Module):
         self.dtype = dtype
         self.use_flash_attention = use_flash_attention
 
-        self.dynamics = STTransformer(
+        self.transformer = STTransformer(
             self.model_dim,
             self.model_dim,
             self.ffn_dim,
@@ -48,6 +48,8 @@ class DynamicsMaskGIT(nnx.Module):
             self.param_dtype,
             self.dtype,
             use_flash_attention=self.use_flash_attention,
+            spatial_causal=False,
+            decode=False,
             rngs=rngs,
         )
         self.patch_embed = nnx.Embed(self.num_latents, self.model_dim, rngs=rngs)
@@ -88,5 +90,5 @@ class DynamicsMaskGIT(nnx.Module):
         # --- Predict transition ---
         act_embed = self.action_up(batch["latent_actions"])
         vid_embed += jnp.pad(act_embed, ((0, 0), (1, 0), (0, 0), (0, 0)))
-        logits = self.dynamics(vid_embed)
+        logits = self.transformer(vid_embed)
         return logits, mask

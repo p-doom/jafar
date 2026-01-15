@@ -235,7 +235,7 @@ class AxialTransformer(nnx.Module):
             self.model_dim, max_len=max_len
         )
 
-        self.blocks = []
+        self.blocks = nnx.List([])
         for _ in range(self.num_blocks):
             self.blocks.append(
                 AxialBlock(
